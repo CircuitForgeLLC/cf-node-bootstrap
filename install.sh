@@ -67,6 +67,7 @@ packages=(
     lm-sensors
     curl
     net-tools
+    bc
 )
 
 # OS distribution auto-detection
