@@ -1,0 +1,748 @@
+#!/usr/bin/env bash
+
+# ProtonVPN CLI Tool
+# Path: ~/bin/protonvpn-cli or /usr/local/bin/protonvpn-cli
+# 
+# Purpose: Command-line interface for managing ProtonVPN WireGuard connections
+# Provides nordvpn-like functionality: auto-connect, country selection, speed testing
+# 
+# Usage:
+#   protonvpn-cli connect [country]     - Connect to fastest server (optionally from specific country)
+#   protonvpn-cli disconnect           - Disconnect from current server
+#   protonvpn-cli status               - Show connection status
+#   protonvpn-cli list [countries]     - List available servers or countries
+#   protonvpn-cli update               - Update server configurations
+#   protonvpn-cli speedtest           - Test speeds of available servers
+#   protonvpn-cli help                - Show this help message
+
+set -euo pipefail
+
+# Configuration
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly CONFIG_DIR="${HOME}/.config/protonvpn-cli"
+readonly CONFIGS_DIR="${CONFIG_DIR}/configs"
+readonly STATE_FILE="${CONFIG_DIR}/state.json"
+readonly SPEED_CACHE="${CONFIG_DIR}/speeds.json"
+readonly GENERATOR_SCRIPT="${SCRIPT_DIR}/protonvpn_generator.py"
+readonly LOG_FILE="${CONFIG_DIR}/protonvpn-cli.log"
+
+# Colors for output
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[1;33m'
+readonly BLUE='\033[0;34m'
+readonly CYAN='\033[0;36m'
+readonly BOLD='\033[1m'
+readonly NC='\033[0m' # No Color
+
+# Global variables
+VERBOSE=false
+DRY_RUN=false
+CURRENT_CONNECTION=""
+
+#######################################
+# Print colored status messages to stderr
+# Arguments:
+#   $1 - log level (INFO, WARN, ERROR, SUCCESS)
+#   $2+ - message
+#######################################
+print_status() {
+    local level="$1"
+    shift
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    
+    case "$level" in
+        "INFO")
+            echo -e "${BLUE}[INFO]${NC} $*" >&2
+            ;;
+        "WARN")
+            echo -e "${YELLOW}[WARN]${NC} $*" >&2
+            ;;
+        "ERROR")
+            echo -e "${RED}[ERROR]${NC} $*" >&2
+            ;;
+        "SUCCESS")
+            echo -e "${GREEN}[SUCCESS]${NC} $*" >&2
+            ;;
+        "DEBUG")
+            if [[ "$VERBOSE" == "true" ]]; then
+                echo -e "${CYAN}[DEBUG]${NC} $*" >&2
+            fi
+            ;;
+    esac
+    
+    # Log to file
+    echo "[$timestamp] [$level] $*" >> "$LOG_FILE"
+}
+
+#######################################
+# Check if a command exists
+# Arguments:
+#   $1 - command name
+# Returns:
+#   0 if command exists, 1 otherwise
+#######################################
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+#######################################
+# Check system dependencies
+#######################################
+check_dependencies() {
+    print_status "DEBUG" "Checking system dependencies..."
+    
+    local missing_deps=()
+    
+    # Essential commands
+    for cmd in wg wg-quick jq curl ping; do
+        if ! command_exists "$cmd"; then
+            missing_deps+=("$cmd")
+        fi
+    done
+    
+    # Python for generator script
+    if ! command_exists python3; then
+        missing_deps+=("python3")
+    fi
+    
+    if [[ ${#missing_deps[@]} -gt 0 ]]; then
+        print_status "ERROR" "Missing required dependencies: ${missing_deps[*]}"
+        print_status "INFO" "Install with: sudo apt update && sudo apt install wireguard-tools jq curl iputils-ping python3"
+        return 1
+    fi
+    
+    # Check if running as root for WireGuard operations
+    if [[ $EUID -ne 0 ]] && [[ "${1:-}" != "list" ]] && [[ "${1:-}" != "status" ]] && [[ "${1:-}" != "help" ]]; then
+        print_status "WARN" "WireGuard operations require root privileges"
+        print_status "INFO" "Try: sudo $0 $*"
+        return 1
+    fi
+    
+    return 0
+}
+
+#######################################
+# Initialize configuration directory
+#######################################
+init_config() {
+    print_status "DEBUG" "Initializing configuration directory..."
+    
+    mkdir -p "$CONFIG_DIR" "$CONFIGS_DIR"
+    
+    # Create state file if it doesn't exist
+    if [[ ! -f "$STATE_FILE" ]]; then
+        echo '{"current_connection": "", "last_update": 0}' > "$STATE_FILE"
+    fi
+    
+    # Create speed cache if it doesn't exist
+    if [[ ! -f "$SPEED_CACHE" ]]; then
+        echo '{}' > "$SPEED_CACHE"
+    fi
+    
+    # Ensure log file exists
+    touch "$LOG_FILE"
+}
+
+#######################################
+# Get current connection status
+# Returns:
+#   Connection info or empty string
+#######################################
+get_connection_status() {
+    local active_interface
+    active_interface=$(wg show 2>/dev/null | grep -E '^interface:' | head -1 | cut -d' ' -f2 || true)
+    
+    if [[ -n "$active_interface" ]]; then
+        # Extract server info from interface name (assuming format like wg-CH-01)
+        local server_info
+        server_info=$(echo "$active_interface" | sed 's/^wg-//')
+        echo "$server_info"
+    else
+        echo ""
+    fi
+}
+
+#######################################
+# Parse WireGuard config to extract server info
+# Arguments:
+#   $1 - config file path
+#######################################
+parse_config_info() {
+    local config_file="$1"
+    local server_name endpoint country
+    
+    server_name=$(basename "$config_file" .conf)
+    endpoint=$(grep -E '^Endpoint' "$config_file" | cut -d'=' -f2 | tr -d ' ' | cut -d':' -f1)
+    
+    # Extract country from filename (assuming format like wg-CH-01)
+    country=$(echo "$server_name" | sed 's/^wg-//' | cut -d'-' -f1)
+    
+    echo "$server_name|$endpoint|$country"
+}
+
+#######################################
+# List available servers or countries
+# Arguments:
+#   $1 - "countries" to list countries, otherwise list servers
+#######################################
+list_servers() {
+    local list_type="${1:-servers}"
+    
+    if [[ ! -d "$CONFIGS_DIR" ]] || [[ -z "$(ls -A "$CONFIGS_DIR" 2>/dev/null)" ]]; then
+        print_status "WARN" "No server configurations found. Run 'protonvpn update' first."
+        return 1
+    fi
+    
+    case "$list_type" in
+        "countries")
+            print_status "INFO" "Available countries:"
+            local countries=()
+            while IFS= read -r -d '' config; do
+                local info
+                info=$(parse_config_info "$config")
+                local country
+                country=$(echo "$info" | cut -d'|' -f3)
+                countries+=("$country")
+            done < <(find "$CONFIGS_DIR" -name "*.conf" -print0)
+            
+            # Sort and deduplicate countries
+            printf '%s\n' "${countries[@]}" | sort -u | while read -r country; do
+                printf "  %s\n" "$country"
+            done
+            ;;
+        *)
+            print_status "INFO" "Available servers:"
+            printf "%-20s %-15s %-10s %s\n" "SERVER" "ENDPOINT" "COUNTRY" "STATUS"
+            printf "%-20s %-15s %-10s %s\n" "------" "--------" "-------" "------"
+            
+            local current_server
+            current_server=$(get_connection_status)
+            
+            while IFS= read -r -d '' config; do
+                local info
+                info=$(parse_config_info "$config")
+                IFS='|' read -r server_name endpoint country <<< "$info"
+                
+                local status="Available"
+                if [[ "$server_name" == *"$current_server"* ]] && [[ -n "$current_server" ]]; then
+                    status="${GREEN}Connected${NC}"
+                fi
+                
+                printf "%-20s %-15s %-10s %s\n" "$server_name" "$endpoint" "$country" "$status"
+            done < <(find "$CONFIGS_DIR" -name "*.conf" -print0 | sort -z)
+            ;;
+    esac
+}
+
+#######################################
+# Test server speed/latency
+# Arguments:
+#   $1 - server endpoint IP
+# Returns:
+#   Latency in milliseconds or 9999 if unreachable
+#######################################
+test_server_speed() {
+    local endpoint="$1"
+    local latency
+    
+    print_status "DEBUG" "Testing latency to $endpoint..."
+    
+    # Use ping to test latency (3 packets, 2 second timeout)
+    if latency=$(ping -c 3 -W 2 "$endpoint" 2>/dev/null | tail -1 | awk -F '/' '{print $5}' 2>/dev/null); then
+        if [[ -n "$latency" ]]; then
+            printf "%.0f" "$latency"
+            return 0
+        fi
+    fi
+    
+    # If ping fails, return high latency
+    echo "9999"
+    return 1
+}
+
+#######################################
+# Find fastest server
+# Arguments:
+#   $1 - optional country filter
+# Returns:
+#   Path to fastest server config
+#######################################
+find_fastest_server() {
+    local country_filter="${1:-}"
+    local best_config=""
+    local best_latency=9999
+    local tested_count=0
+    local max_tests=10  # Limit tests for performance
+    
+    print_status "INFO" "Finding fastest server${country_filter:+ in $country_filter}..."
+    
+    # Create array of matching configs
+    local configs=()
+    while IFS= read -r -d '' config; do
+        if [[ -n "$country_filter" ]]; then
+            local info
+            info=$(parse_config_info "$config")
+            local country
+            country=$(echo "$info" | cut -d'|' -f3)
+            if [[ "$country" == "$country_filter" ]]; then
+                configs+=("$config")
+            fi
+        else
+            configs+=("$config")
+        fi
+    done < <(find "$CONFIGS_DIR" -name "*.conf" -print0)
+    
+    if [[ ${#configs[@]} -eq 0 ]]; then
+        print_status "ERROR" "No servers found${country_filter:+ for country $country_filter}"
+        return 1
+    fi
+    
+    # Shuffle array to test random subset
+    local shuffled_configs=()
+    while [[ ${#configs[@]} -gt 0 ]]; do
+        local index=$((RANDOM % ${#configs[@]}))
+        shuffled_configs+=("${configs[$index]}")
+        unset 'configs[$index]'
+        configs=("${configs[@]}")  # Re-index array
+    done
+    
+    # Test servers
+    for config in "${shuffled_configs[@]}"; do
+        if [[ $tested_count -ge $max_tests ]]; then
+            break
+        fi
+        
+        local info
+        info=$(parse_config_info "$config")
+        local server_name endpoint
+        IFS='|' read -r server_name endpoint _ <<< "$info"
+        
+        local latency
+        latency=$(test_server_speed "$endpoint")
+        
+        print_status "DEBUG" "Server $server_name: ${latency}ms"
+        
+        if (( $(echo "$latency < $best_latency" | bc -l 2>/dev/null || echo "$latency -lt $best_latency") )); then
+            best_latency=$latency
+            best_config="$config"
+        fi
+        
+        ((tested_count++))
+    done
+    
+    if [[ -n "$best_config" ]]; then
+        local info
+        info=$(parse_config_info "$best_config")
+        local server_name
+        server_name=$(echo "$info" | cut -d'|' -f1)
+        print_status "SUCCESS" "Fastest server: $server_name (${best_latency}ms)"
+        echo "$best_config"
+        return 0
+    else
+        print_status "ERROR" "Could not find accessible server"
+        return 1
+    fi
+}
+
+#######################################
+# Connect to VPN server
+# Arguments:
+#   $1 - optional country or specific server
+#######################################
+connect_vpn() {
+    local target="${1:-}"
+    local config_file=""
+    
+    # Check if already connected
+    local current_connection
+    current_connection=$(get_connection_status)
+    if [[ -n "$current_connection" ]]; then
+        print_status "INFO" "Already connected to $current_connection"
+        print_status "INFO" "Disconnect first with: protonvpn disconnect"
+        return 1
+    fi
+    
+    # Determine which server to connect to
+    if [[ -z "$target" ]]; then
+        # Auto-select fastest server
+        config_file=$(find_fastest_server)
+    elif [[ -f "$CONFIGS_DIR/wg-${target}.conf" ]]; then
+        # Specific server by name
+        config_file="$CONFIGS_DIR/wg-${target}.conf"
+        print_status "INFO" "Using specific server: $target"
+    elif [[ ${#target} -eq 2 ]] && [[ "$target" =~ ^[A-Z]{2}$ ]]; then
+        # Country code - find fastest in country
+        config_file=$(find_fastest_server "$target")
+    else
+        # Try to find server containing the target string
+        local matches
+        mapfile -t matches < <(find "$CONFIGS_DIR" -name "*${target}*" -name "*.conf")
+        
+        if [[ ${#matches[@]} -eq 1 ]]; then
+            config_file="${matches[0]}"
+        elif [[ ${#matches[@]} -gt 1 ]]; then
+            print_status "ERROR" "Multiple servers match '$target':"
+            for match in "${matches[@]}"; do
+                local info
+                info=$(parse_config_info "$match")
+                printf "  %s\n" "$(echo "$info" | cut -d'|' -f1)" >&2
+            done
+            return 1
+        else
+            print_status "ERROR" "No server found matching '$target'"
+            return 1
+        fi
+    fi
+    
+    if [[ -z "$config_file" ]]; then
+        print_status "ERROR" "Failed to determine server configuration"
+        return 1
+    fi
+    
+    # Extract interface name from config file
+    local interface_name
+    interface_name=$(basename "$config_file" .conf)
+    
+    print_status "INFO" "Connecting to $(parse_config_info "$config_file" | cut -d'|' -f1)..."
+    
+    if [[ "$DRY_RUN" == "true" ]]; then
+        print_status "INFO" "DRY RUN: Would execute: wg-quick up $config_file"
+        return 0
+    fi
+    
+    # Connect using wg-quick
+    if wg-quick up "$config_file" >/dev/null 2>&1; then
+        # Update state file
+        jq --arg conn "$(parse_config_info "$config_file" | cut -d'|' -f1)" \
+           '.current_connection = $conn' "$STATE_FILE" > "${STATE_FILE}.tmp" && \
+        mv "${STATE_FILE}.tmp" "$STATE_FILE"
+        
+        print_status "SUCCESS" "Connected to $(parse_config_info "$config_file" | cut -d'|' -f1)"
+        
+        # Show connection info
+        show_status
+    else
+        print_status "ERROR" "Failed to connect to VPN"
+        return 1
+    fi
+}
+
+#######################################
+# Disconnect from VPN
+#######################################
+disconnect_vpn() {
+    local current_connection
+    current_connection=$(get_connection_status)
+    
+    if [[ -z "$current_connection" ]]; then
+        print_status "INFO" "Not connected to any VPN server"
+        return 0
+    fi
+    
+    print_status "INFO" "Disconnecting from $current_connection..."
+    
+    if [[ "$DRY_RUN" == "true" ]]; then
+        print_status "INFO" "DRY RUN: Would disconnect from all WireGuard interfaces"
+        return 0
+    fi
+    
+    # Disconnect all WireGuard interfaces
+    local interfaces
+    mapfile -t interfaces < <(wg show 2>/dev/null | grep -E '^interface:' | cut -d' ' -f2 || true)
+    
+    local disconnected=false
+    for interface in "${interfaces[@]}"; do
+        if wg-quick down "$interface" >/dev/null 2>&1; then
+            print_status "SUCCESS" "Disconnected from $interface"
+            disconnected=true
+        fi
+    done
+    
+    if [[ "$disconnected" == "true" ]]; then
+        # Update state file
+        jq '.current_connection = ""' "$STATE_FILE" > "${STATE_FILE}.tmp" && \
+        mv "${STATE_FILE}.tmp" "$STATE_FILE"
+    else
+        print_status "WARN" "No active connections found to disconnect"
+    fi
+}
+
+#######################################
+# Show current connection status
+#######################################
+show_status() {
+    local current_connection
+    current_connection=$(get_connection_status)
+    
+    if [[ -n "$current_connection" ]]; then
+        print_status "INFO" "Status: ${GREEN}Connected${NC}"
+        printf "Server: %s\n" "$current_connection" >&2
+        
+        # Show WireGuard interface details
+        if command_exists wg && [[ "$VERBOSE" == "true" ]]; then
+            print_status "DEBUG" "WireGuard interface details:"
+            wg show 2>/dev/null | while IFS= read -r line; do
+                printf "  %s\n" "$line" >&2
+            done
+        fi
+        
+        # Test current connection
+        if command_exists curl; then
+            local public_ip
+            if public_ip=$(curl -s --max-time 5 ifconfig.me 2>/dev/null); then
+                printf "Public IP: %s\n" "$public_ip" >&2
+            fi
+        fi
+    else
+        print_status "INFO" "Status: ${RED}Disconnected${NC}"
+    fi
+}
+
+#######################################
+# Update server configurations
+#######################################
+update_configs() {
+    if [[ ! -f "$GENERATOR_SCRIPT" ]]; then
+        print_status "ERROR" "Generator script not found: $GENERATOR_SCRIPT"
+        print_status "INFO" "Please ensure the ProtonVPN generator script is available"
+        return 1
+    fi
+    
+    print_status "INFO" "Updating server configurations..."
+    print_status "WARN" "This may take a while due to API rate limiting..."
+    
+    if [[ "$DRY_RUN" == "true" ]]; then
+        print_status "INFO" "DRY RUN: Would run generator script to update configs"
+        return 0
+    fi
+    
+    # Update OUTPUT_DIR in generator script to point to our configs directory
+    local temp_script="${CONFIG_DIR}/temp_generator.py"
+    sed "s|OUTPUT_DIR = \"./configs\"|OUTPUT_DIR = \"$CONFIGS_DIR\"|" "$GENERATOR_SCRIPT" > "$temp_script"
+    
+    if python3 "$temp_script"; then
+        print_status "SUCCESS" "Server configurations updated"
+        
+        # Update state file with last update time
+        jq --arg time "$(date +%s)" '.last_update = ($time | tonumber)' "$STATE_FILE" > "${STATE_FILE}.tmp" && \
+        mv "${STATE_FILE}.tmp" "$STATE_FILE"
+        
+        # Clean up
+        rm -f "$temp_script"
+    else
+        print_status "ERROR" "Failed to update configurations"
+        rm -f "$temp_script"
+        return 1
+    fi
+}
+
+#######################################
+# Run speed tests on available servers
+#######################################
+run_speedtest() {
+    local country_filter="${1:-}"
+    
+    print_status "INFO" "Running speed tests${country_filter:+ for $country_filter}..."
+    
+    # Create results array
+    declare -a results
+    local count=0
+    
+    while IFS= read -r -d '' config; do
+        local info
+        info=$(parse_config_info "$config")
+        IFS='|' read -r server_name endpoint country <<< "$info"
+        
+        # Apply country filter if specified
+        if [[ -n "$country_filter" ]] && [[ "$country" != "$country_filter" ]]; then
+            continue
+        fi
+        
+        local latency
+        latency=$(test_server_speed "$endpoint")
+        
+        results+=("$latency|$server_name|$endpoint|$country")
+        ((count++))
+        
+        printf "." >&2  # Progress indicator
+    done < <(find "$CONFIGS_DIR" -name "*.conf" -print0)
+    
+    printf "\n" >&2
+    
+    if [[ $count -eq 0 ]]; then
+        print_status "WARN" "No servers found to test"
+        return 1
+    fi
+    
+    # Sort results by latency and display
+    printf "\n%-20s %-15s %-10s %s\n" "SERVER" "ENDPOINT" "COUNTRY" "LATENCY" >&2
+    printf "%-20s %-15s %-10s %s\n" "------" "--------" "-------" "-------" >&2
+    
+    printf '%s\n' "${results[@]}" | sort -t'|' -k1 -n | while IFS='|' read -r latency server_name endpoint country; do
+        local latency_display
+        if [[ "$latency" == "9999" ]]; then
+            latency_display="${RED}Timeout${NC}"
+        else
+            latency_display="${latency}ms"
+        fi
+        printf "%-20s %-15s %-10s %s\n" "$server_name" "$endpoint" "$country" "$latency_display" >&2
+    done
+}
+
+#######################################
+# Show help message
+#######################################
+show_help() {
+    cat >&2 << 'EOF'
+ProtonVPN CLI - WireGuard VPN Manager
+
+USAGE:
+    protonvpn <command> [options]
+
+COMMANDS:
+    connect [target]       Connect to VPN server
+                          - No target: auto-select fastest server
+                          - Country code (e.g., US, CH): fastest in country  
+                          - Server name: specific server
+    
+    disconnect            Disconnect from current VPN server
+    
+    status               Show current connection status
+    
+    list [countries]     List available servers or countries
+    
+    update               Update server configurations from ProtonVPN
+    
+    speedtest [country]  Test latency of available servers
+    
+    help                 Show this help message
+
+GLOBAL OPTIONS:
+    -v, --verbose        Enable verbose output
+    -n, --dry-run        Show what would be done without executing
+    -h, --help           Show help message
+
+EXAMPLES:
+    protonvpn connect              # Connect to fastest available server
+    protonvpn connect US           # Connect to fastest US server
+    protonvpn connect CH-01        # Connect to specific server
+    protonvpn list countries       # List available countries
+    protonvpn speedtest CH         # Test Swiss servers
+    protonvpn status               # Show connection status
+    protonvpn disconnect           # Disconnect from VPN
+
+CONFIGURATION:
+    Config files: ~/.config/protonvpn/
+    WireGuard configs: ~/.config/protonvpn/configs/
+    
+REQUIREMENTS:
+    - wireguard-tools (wg, wg-quick)
+    - jq (JSON processing)
+    - curl (IP detection)
+    - bc (calculations)
+    - Root privileges for connection operations
+
+EOF
+}
+
+#######################################
+# Main function
+#######################################
+main() {
+    # Parse global options first
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -n|--dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -*)
+                print_status "ERROR" "Unknown option: $1"
+                show_help
+                exit 1
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+    
+    # Initialize configuration
+    init_config
+    
+    # Get command
+    local command="${1:-help}"
+    shift || true
+    
+    # Check dependencies for most commands
+    if ! check_dependencies "$command"; then
+        exit 1
+    fi
+    
+    # Execute command
+    case "$command" in
+        "connect"|"c")
+            connect_vpn "$@"
+            ;;
+        "disconnect"|"d")
+            disconnect_vpn
+            ;;
+        "status"|"s")
+            show_status
+            ;;
+        "list"|"l")
+            list_servers "$@"
+            ;;
+        "update"|"u")
+            update_configs
+            ;;
+        "speedtest"|"speed"|"test")
+            run_speedtest "$@"
+            ;;
+        "split")
+            case "${1:-}" in
+                "enable"|"disable")
+                    jq --arg enabled "$([[ "$1" == "enable" ]] && echo true || echo false)" '.enabled = ($enabled == "true")' "$SPLIT_TUNNEL_CONFIG" > "${SPLIT_TUNNEL_CONFIG}.tmp" && mv "${SPLIT_TUNNEL_CONFIG}.tmp" "$SPLIT_TUNNEL_CONFIG"
+                    print_status "SUCCESS" "Split tunneling $1d"
+                    ;;
+                "add-local")
+                    local network="${2:-}"
+                    if [[ -n "$network" ]]; thenupda
+                        jq --arg net "$network" '.local_networks += [$net] | .local_networks |= unique' "$SPLIT_TUNNEL_CONFIG" > "${SPLIT_TUNNEL_CONFIG}.tmp" && mv "${SPLIT_TUNNEL_CONFIG}.tmp" "$SPLIT_TUNNEL_CONFIG"
+                        print_status "SUCCESS" "Added local network: $network"
+                    fi
+                    ;;
+                "list")
+                    print_status "INFO" "Split tunneling configuration:"
+                    jq '.' "$SPLIT_TUNNEL_CONFIG"
+                    ;;
+                *)
+                    print_status "ERROR" "Unknown split command. Use: enable|disable|add-local|list"
+                    ;;
+            esac
+            ;;
+        "help"|"h"|"--help")
+            show_help
+            ;;
+        *)
+            print_status "ERROR" "Unknown command: $command"
+            show_help
+            exit 1
+            ;;
+    esac
+}
+
+# Execute main function if script is run directly
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
