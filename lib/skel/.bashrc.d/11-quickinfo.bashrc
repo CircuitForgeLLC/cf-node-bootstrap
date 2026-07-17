@@ -38,6 +38,12 @@ fi
 scriptname="${BASH_SOURCE[0]##*/}"
 rundir="${BASH_SOURCE[0]%/*}"
 
+# Degree symbol used in temperature readouts. PRbL/functions sets
+# unicode_supported when sourced; fall back to a bare "C" (no degree sign)
+# on terminals/locales without Unicode support.
+deg_symbol='°'
+[[ "$unicode_supported" == true ]] || deg_symbol=''
+
 ########################################
 # Default quickinfo bashrc Preferences #
 ########################################
@@ -396,7 +402,7 @@ get_cpu_temp() {
   
   # Method 1: lm-sensors
   if command -v sensors >/dev/null 2>&1; then
-    temp=$(sensors | grep -m 1 -E 'Core 0|CPU Temp|Tdie' | grep -o -E '[0-9]+\.[0-9]+' | head -n1)
+    temp=$(LC_ALL=C sensors | grep -m 1 -E 'Core 0|CPU Temp|Tdie' | grep -o -E '[0-9]+\.[0-9]+' | head -n1)
     if [ ! -z "$temp" ]; then
       cputemp=$(printf "%.0f" $temp)
     fi
@@ -425,9 +431,9 @@ get_cpu_temp() {
   # Add color warning if temperature is high
   if [[ "$cputemp" != "N/A" ]]; then
     if [[ "$cputemp" -gt "65" ]]; then
-      cputemp="${ong}${blk}${cputemp}°C${dfl}"
+      cputemp="${ong}${blk}${cputemp}${deg_symbol}C${dfl}"
     else
-      cputemp="${cputemp}°C"
+      cputemp="${cputemp}${deg_symbol}C"
     fi
   fi
 }
@@ -450,9 +456,9 @@ get_gpu_info() {
     # Add color to GPU temperature
     if [[ "$gpu_temp" != "N/A" ]]; then
       if [[ "$gpu_temp" -gt "70" ]]; then
-        gpu_temp="${ong}${blk}${gpu_temp}°C${dfl}"
+        gpu_temp="${ong}${blk}${gpu_temp}${deg_symbol}C${dfl}"
       else
-        gpu_temp="${gpu_temp}°C"
+        gpu_temp="${gpu_temp}${deg_symbol}C"
       fi
     fi
     
@@ -468,9 +474,9 @@ get_gpu_info() {
     # Add color to GPU temperature
     if [[ "$gpu_temp" != "N/A" ]]; then
       if [[ "$gpu_temp" -gt "70" ]]; then
-        gpu_temp="${ong}${blk}${gpu_temp}°C${dfl}"
+        gpu_temp="${ong}${blk}${gpu_temp}${deg_symbol}C${dfl}"
       else
-        gpu_temp="${gpu_temp}°C"
+        gpu_temp="${gpu_temp}${deg_symbol}C"
       fi
     fi
     
@@ -770,14 +776,14 @@ get_cpu_temp
 location=$(uname -a | awk '{print $2}')
 image_version=$(uname -r)
 software_version="$OS $VER"
-mem_usage=$(free -m | grep Mem | awk '{print $3"M/"$2"M"}')
+mem_usage=$(LC_ALL=C free -m | grep Mem | awk '{print $3"M/"$2"M"}')
 
 # Get swap usage
-swap_usage=$(free -m | grep Swap | awk '{if ($2 > 0) print $3"M/"$2"M"; else print "None"}')
+swap_usage=$(LC_ALL=C free -m | grep Swap | awk '{if ($2 > 0) print $3"M/"$2"M"; else print "None"}')
 
 # Get number of CPUs and load averages
 num_cpus=$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 1)
-load_check=$(uptime | sed -r 's|.*load average: ([\.0-9]+), ([\.0-9]+), ([\.0-9]+)|\1 \2 \3|g')
+load_check=$(LC_ALL=C uptime | sed -r 's|.*load average: ([\.0-9]+), ([\.0-9]+), ([\.0-9]+)|\1 \2 \3|g')
 load_averages=$(echo "$load_check $num_cpus" | awk '{printf "5min: %.0f%% ", $1/$4*100} {printf "10min: %.0f%% ", $2/$4*100} {printf "15min: %.0f%%", $3/$4*100}' ORS=' ')
 
 # Calculate CPU utilization
@@ -796,20 +802,24 @@ cpu_total_cur=$((user+system+nice+softirq+steal+idle+iowait))
 cpu_util=$((100*( cpu_active_cur-cpu_active_prev ) / (cpu_total_cur-cpu_total_prev) ))
 
 # Get uptime in human-readable format
-if [[ "$(uptime | grep -iq day ; echo $?)" == "0" ]] ; then
+# NOTE: this token-position parsing is locale/format-fragile (procps wording
+# and column count shift across distros); LC_ALL=C at least stabilizes the
+# wording. A /proc/uptime-based rewrite would be more robust; tracked as follow-up.
+uptime_raw="$(LC_ALL=C uptime)"
+if [[ "$(grep -iq day <<< "$uptime_raw" ; echo $?)" == "0" ]] ; then
     # first logic gate, if the system has been online for at least a day
-    if [[ "$(uptime | grep -iq min ; echo $?)" == "0" ]] ; then
+    if [[ "$(grep -iq min <<< "$uptime_raw" ; echo $?)" == "0" ]] ; then
         # nested logic gate. If the system has been online for more than a day
         # but less than a day and an hour, the tokens shift and requires alternate parsing
-        s_uptime=$(uptime | awk '{print $3 " " $4 " " $5 " Minutes"}')
+        s_uptime=$(awk '{print $3 " " $4 " " $5 " Minutes"}' <<< "$uptime_raw")
     else # gate for if the system has been online longer than one day and one hour
-        s_uptime=$(uptime | awk '{print $3 " " $4 " " $5 " Hours"}')
+        s_uptime=$(awk '{print $3 " " $4 " " $5 " Hours"}' <<< "$uptime_raw")
     fi
 else # logic gate for if the system has been online less than a day but more than an hour
-    if [[ "$(uptime | grep -iq min ; echo $?)" == "1" ]] ; then
-        s_uptime=$(uptime | awk '{print $3 " Hours  "}')
+    if [[ "$(grep -iq min <<< "$uptime_raw" ; echo $?)" == "1" ]] ; then
+        s_uptime=$(awk '{print $3 " Hours  "}' <<< "$uptime_raw")
     else
-        s_uptime=$(uptime | awk '{print $3 " Minutes    "}')
+        s_uptime=$(awk '{print $3 " Minutes    "}' <<< "$uptime_raw")
     fi
 fi
 
