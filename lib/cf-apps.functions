@@ -8,6 +8,23 @@
 
 cf_apps_manifest_dir="${cf_apps_manifest_dir:-${rundir}/cf-apps}"
 
+# State file recording what this installer has set up on this node, so
+# lib/skel/.bashrc.d/11-quickinfo.bashrc can report on it. Plain
+# sourceable key=value pairs (values %q-escaped), one write-or-replace
+# per key - not a general config format, just enough for quickinfo to read.
+cf_node_state_file="${cf_node_state_file:-${HOME}/.config/cf-node-bootstrap/state.conf}"
+
+record-cf-node-state() {
+  local key="$1" value="$2"
+  mkdir -p "$(dirname "$cf_node_state_file")"
+  touch "$cf_node_state_file"
+  if [ -s "$cf_node_state_file" ]; then
+    grep -v "^${key}=" "$cf_node_state_file" > "${cf_node_state_file}.tmp"
+    mv "${cf_node_state_file}.tmp" "$cf_node_state_file"
+  fi
+  printf '%s=%q\n' "$key" "$value" >> "$cf_node_state_file"
+}
+
 # Resets the app_* manifest variables/functions so sourcing one manifest
 # can't leak stale values into the next.
 _cf-apps-reset-manifest-vars() {
@@ -88,6 +105,7 @@ cf-provision-node() {
   if [ -z "$cf_provision_profile" ]; then
     select-provision-profile
   fi
+  record-cf-node-state "cf_node_profile" "$cf_provision_profile"
 
   if [[ "$cf_provision_profile" == "orchard" ]]; then
     provision-orchard-node
@@ -212,6 +230,8 @@ install-cf-app() {
       fi
       ;;
   esac
+
+  record-cf-node-state "cf_app_${app_name//-/_}" "${app_name}:${install_type}:${clone_dir}"
 }
 
 # Narrow, single-purpose flow for adding a GPU worker node to an existing
@@ -251,4 +271,20 @@ provision-orchard-node() {
 
   boxline "Handing off to circuitforge-orch's own install.sh..."
   (cd "$clone_dir" && ./install.sh)
+
+  # circuitforge-orch's installer writes its own resulting config to
+  # ~/.config/circuitforge/cf-orch.env (CFORCH_MODE, CFORCH_COORDINATOR_URL);
+  # read that back rather than trying to track which topology the user
+  # picked inside its interactive prompts.
+  local orch_env_file="${HOME}/.config/circuitforge/cf-orch.env"
+  if [ -f "$orch_env_file" ]; then
+    local cforch_mode cforch_coordinator_url
+    cforch_mode=$(grep -m1 '^CFORCH_MODE=' "$orch_env_file" | cut -d= -f2-)
+    cforch_coordinator_url=$(grep -m1 '^CFORCH_COORDINATOR_URL=' "$orch_env_file" | cut -d= -f2-)
+    record-cf-node-state "cf_orchard_role" "${cforch_mode:-unknown}"
+    record-cf-node-state "cf_orchard_coordinator_url" "$cforch_coordinator_url"
+    record-cf-node-state "cf_orchard_dir" "$clone_dir"
+  else
+    warn "Couldn't find ${orch_env_file} after install - orchard role won't show in quickinfo until it exists"
+  fi
 }

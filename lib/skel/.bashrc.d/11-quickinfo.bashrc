@@ -97,6 +97,7 @@ show_smart_status=false # Requires root privileges or sudo config
 show_top_processes=true
 show_power_info=true # Enable power monitoring (requires appropriate hardware/sensors)
 show_power_details=false
+show_cf_node_info=true # Show installed CircuitForge apps / orchard role (requires cf-node-bootstrap's install-time state file)
 
 # Services to check (space separated list)
 critical_services="sshd nginx apache2 mysqld mariadb docker containerd kubelet cron"
@@ -578,6 +579,85 @@ get_container_info() {
   # fi
 }
 
+################################
+# Get CircuitForge Node Info
+################################
+# Reads the state file cf-node-bootstrap's installer writes (see
+# lib/cf-apps.functions:record-cf-node-state) - not present unless that
+# installer's CF Apps menu has been run on this node at least once.
+
+# Best-effort running/stopped check for a single installed app. Docker
+# compose-based apps are checked by compose project (from the clone dir),
+# not by container name, since compose's generated container names don't
+# match the app name directly. Single-container apps (no compose file
+# present) fall back to a name match against `docker ps`.
+_cf_node_app_status() {
+  local dir="$1" install_type="$2" app_name="$3"
+  if [[ "$install_type" != "docker" ]]; then
+    echo "n/a"
+    return
+  fi
+  command -v docker >/dev/null 2>&1 || { echo "n/a"; return; }
+
+  local compose_file=""
+  for f in compose.yml docker-compose.yml; do
+    if [ -f "${dir}/${f}" ]; then
+      compose_file="$f"
+      break
+    fi
+  done
+
+  if [ -n "$compose_file" ]; then
+    if (cd "$dir" && docker compose -f "$compose_file" ps -q 2>/dev/null | grep -q .); then
+      echo "running"
+    else
+      echo "stopped"
+    fi
+  elif docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$app_name"; then
+    echo "running"
+  else
+    echo "stopped"
+  fi
+}
+
+get_cf_node_info() {
+  cf_node_info_available=false
+  cf_node_profile_display="N/A"
+  cf_node_apps_display=()
+  cf_node_orchard_display=""
+
+  local state_file="${HOME}/.config/cf-node-bootstrap/state.conf"
+  [ -f "$state_file" ] || return
+  cf_node_info_available=true
+
+  # State file only defines cf_node_*/cf_app_*/cf_orchard_* keys (written by
+  # record-cf-node-state), so sourcing it here won't clobber other quickinfo
+  # variables.
+  source "$state_file"
+
+  cf_node_profile_display="${cf_node_profile:-unknown}"
+
+  local var app_value app_name install_type clone_dir status status_disp
+  for var in $(compgen -v cf_app_ 2>/dev/null); do
+    app_value="${!var}"
+    IFS=':' read -r app_name install_type clone_dir <<< "$app_value"
+    status=$(_cf_node_app_status "$clone_dir" "$install_type" "$app_name")
+    case "$status" in
+      running) status_disp="${grn}running${dfl}" ;;
+      stopped) status_disp="${lrd}stopped${dfl}" ;;
+      *)       status_disp="${gry}${install_type}${dfl}" ;;
+    esac
+    cf_node_apps_display+=("${app_name} ${gry}(${install_type})${dfl}: ${status_disp}")
+  done
+
+  if [ -n "$cf_orchard_role" ]; then
+    cf_node_orchard_display="${bld}Role:${dfl} ${ylw}${cf_orchard_role}${dfl}"
+    if [ -n "$cf_orchard_coordinator_url" ]; then
+      cf_node_orchard_display="${cf_node_orchard_display} | ${bld}Coordinator:${dfl} ${cyn}${cf_orchard_coordinator_url}${dfl}"
+    fi
+  fi
+}
+
 # Get public IP address using multiple fallbacks
 get_wan_ip() {
   wan_ip="Unavailable"
@@ -855,6 +935,10 @@ if [ "$show_container_info" = true ]; then
   get_container_info
 fi
 
+if [ "$show_cf_node_info" = true ]; then
+  get_cf_node_info
+fi
+
 if [ "$show_service_status" = true ]; then
   get_service_status
 fi
@@ -948,6 +1032,22 @@ if [ "$show_container_info" = true ] && [[ "$in_container" = true || "$have_cont
   fi
   if [ "$have_containers" = true ]; then
     boxline "	${bld}Container Status:${dfl} ${container_stats}"
+  fi
+fi
+
+# CircuitForge node information
+if [ "$show_cf_node_info" = true ] && [ "$cf_node_info_available" = true ]; then
+  boxline ""
+  boxline "${bld}${unl}CircuitForge Node:${dfl}"
+  boxline "	${bld}Profile:${dfl} ${mag}${cf_node_profile_display}${dfl}"
+  if [ -n "$cf_node_orchard_display" ]; then
+    boxline "	${bld}Orchard:${dfl} ${cf_node_orchard_display}"
+  fi
+  if [ "${#cf_node_apps_display[@]}" -gt 0 ]; then
+    boxline "	${bld}Installed apps:${dfl}"
+    for app_line in "${cf_node_apps_display[@]}"; do
+      boxline "		${app_line}"
+    done
   fi
 fi
 
