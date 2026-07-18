@@ -1,0 +1,20 @@
+app_name="circuitforge-core"
+app_desc="Shared scaffold (db/llm/tiers/config) used by other CF products"
+app_repo_url_github="https://github.com/CircuitForgeLLC/circuitforge-core.git"
+app_repo_url_forgejo="https://git.opensourcesolarpunk.com/Circuit-Forge/circuitforge-core.git"
+# Not directly user-selectable in the app menu (installed automatically as a
+# dependency by install-cf-core-dependency), but still needs a profile list
+# so its own clone step honors the oem/collaborator remote split.
+app_available_profiles=(oem collaborator)
+app_install_types=(bare-metal)
+app_conda_env="cf"
+app_env_template=""
+app_needs_core=false
+
+app_setup_bare_metal() {
+  local dir="$1"
+  run "conda run -n ${app_conda_env} pip install -e \"${dir}\""
+  if [[ $dry_run != true ]]; then
+    conda run -n "${app_conda_env}" pip install -e "${dir}"
+  fi
+}

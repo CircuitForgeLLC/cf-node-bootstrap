@@ -1,0 +1,254 @@
+#!/bin/bash
+# CF Apps registry + interactive install dispatcher for cf-node-bootstrap.
+#
+# Manifests live in cf-apps/*.manifest (see cf-apps/README.md for the
+# schema). Design rationale, including the oem/collaborator/orchard
+# provisioning-profile split, is in:
+#   circuitforge-plans/cf-node-bootstrap/superpowers/plans/2026-07-17-cf-apps-install-menu.md
+
+cf_apps_manifest_dir="${cf_apps_manifest_dir:-${rundir}/cf-apps}"
+
+# Resets the app_* manifest variables/functions so sourcing one manifest
+# can't leak stale values into the next.
+_cf-apps-reset-manifest-vars() {
+  unset app_name app_desc app_repo_url_github app_repo_url_forgejo \
+        app_available_profiles app_install_types app_conda_env \
+        app_env_template app_needs_core
+  unset -f app_setup_bare_metal app_setup_docker app_setup_podman 2>/dev/null
+}
+
+# Prompts for a base directory to clone CF app repos into; sets $cf_apps_dir.
+prompt-cf-apps-dir() {
+  local default_dir="${HOME}/CircuitForge"
+  boxborder "${lyl}Where should CircuitForge app repos be cloned?${dfl} ${gry}(default: ${default_dir})${dfl}"
+  local input_dir
+  read -r input_dir
+  cf_apps_dir="${input_dir:-$default_dir}"
+}
+
+# Yes/no gate + entry point, mirroring install.sh's extras-menu pattern.
+# Call this from install.sh's userinstall/globalinstall alongside extras-menu.
+cf-provision-menu() {
+  boxborder "${lyl}Set up this node for CircuitForge apps?${dfl} ${gry}(product installs or joining an orchard)${dfl}"
+  local cfapps_menu=(
+    "$(boxline "${green_check} Yes")"
+    "$(boxline "${red_x} No")"
+  )
+  case `select_opt "${cfapps_menu[@]}"` in
+    0)  prompt-cf-apps-dir
+        cf-provision-node
+        ;;
+    1)  boxline "Skipping CircuitForge app provisioning" ;;
+  esac
+}
+
+# Populates parallel arrays describing every available app manifest.
+# Call before cf-apps-menu.
+load-cf-apps() {
+  cf_app_names=()
+  cf_app_descs=()
+  cf_app_profiles=()
+  local manifest
+  for manifest in "${cf_apps_manifest_dir}"/*.manifest; do
+    [ -f "$manifest" ] || continue
+    _cf-apps-reset-manifest-vars
+    source "$manifest"
+    cf_app_names+=("$app_name")
+    cf_app_descs+=("$app_desc")
+    cf_app_profiles+=("${app_available_profiles[*]}")
+  done
+}
+
+# Returns success if $1 (a space-joined profile list) contains $2
+_cf-apps-profile-allows() {
+  local profiles=" $1 " want="$2"
+  [[ "$profiles" == *" $want "* ]]
+}
+
+# Prompts for what kind of node this is; sets $cf_provision_profile to
+# oem|collaborator|orchard. Gates both which apps are offered and which
+# remote (public GitHub vs private Forgejo) they're cloned from.
+select-provision-profile() {
+  boxborder "${lyl}${unl}What kind of node is this?${dfl}"
+  profile_menu=(
+    "$(boxline "OEM / customer node ${gry}(public GitHub only, licensed products)${dfl}")"
+    "$(boxline "Collaborator node ${gry}(private Forgejo, full app list)${dfl}")"
+    "$(boxline "Orchard-join node ${gry}(cf-orch agent only)${dfl}")"
+  )
+  case `select_opt "${profile_menu[@]}"` in
+    0) cf_provision_profile="oem" ;;
+    1) cf_provision_profile="collaborator" ;;
+    2) cf_provision_profile="orchard" ;;
+  esac
+}
+
+# Top-level entry point: prompts for a profile (unless already set), then
+# either runs the orchard-join flow or offers the app multiselect menu.
+cf-provision-node() {
+  if [ -z "$cf_provision_profile" ]; then
+    select-provision-profile
+  fi
+
+  if [[ "$cf_provision_profile" == "orchard" ]]; then
+    provision-orchard-node
+    return
+  fi
+
+  cf-apps-menu
+}
+
+cf-apps-menu() {
+  load-cf-apps
+
+  local menu_display=() menu_app_idx=() preselect=()
+  local i
+  for ((i=0; i<${#cf_app_names[@]}; i++)); do
+    if _cf-apps-profile-allows "${cf_app_profiles[$i]}" "$cf_provision_profile"; then
+      menu_display+=("${cf_app_names[$i]} ${gry}- ${cf_app_descs[$i]}${dfl}")
+      menu_app_idx+=("$i")
+      preselect+=("false")
+    fi
+  done
+
+  if [ "${#menu_display[@]}" -eq 0 ]; then
+    warn "No CF apps are available for the '${cf_provision_profile}' profile."
+    return
+  fi
+
+  boxborder "${lyl}${unl}Select CircuitForge apps to install:${dfl}"
+  multiselect result menu_display preselect
+
+  local idx=0 selected_i
+  for selected_i in "${menu_app_idx[@]}"; do
+    if [[ "${result[idx]}" == "true" ]]; then
+      install-cf-app "${cf_app_names[$selected_i]}"
+    fi
+    ((idx++))
+  done
+}
+
+# Installs circuitforge-core as an editable dependency, once per run.
+install-cf-core-dependency() {
+  if [[ "$cf_core_installed" == true ]]; then
+    return
+  fi
+  install-cf-app "circuitforge-core"
+  cf_core_installed=true
+}
+
+# Clones (if needed) and runs setup for a single app by name, honoring
+# $cf_provision_profile for which remote to clone from.
+install-cf-app() {
+  local name="$1"
+  local manifest="${cf_apps_manifest_dir}/${name}.manifest"
+  if [ ! -f "$manifest" ]; then
+    warn "No manifest found for '$name'"
+    return 1
+  fi
+  _cf-apps-reset-manifest-vars
+  source "$manifest"
+
+  if [[ "$app_needs_core" == true ]]; then
+    install-cf-core-dependency
+  fi
+
+  local repo_url
+  if [[ "$cf_provision_profile" == "oem" ]]; then
+    repo_url="$app_repo_url_github"
+  else
+    repo_url="$app_repo_url_forgejo"
+  fi
+
+  local apps_base_dir="${cf_apps_dir:?cf_apps_dir must be set before calling install-cf-app}"
+  local clone_dir="${apps_base_dir}/${app_name}"
+  if [ -d "$clone_dir" ]; then
+    warn "${clone_dir} already exists, skipping clone (will not overwrite)"
+  else
+    boxline "Cloning ${app_name} from ${repo_url}"
+    run "git clone --recurse-submodules \"${repo_url}\" \"${clone_dir}\""
+    if [[ $dry_run != true ]]; then
+      mkdir -p "$apps_base_dir"
+      git clone --recurse-submodules "$repo_url" "$clone_dir"
+    fi
+  fi
+
+  if [ -n "$app_env_template" ] && [ -f "${clone_dir}/${app_env_template}" ] && [ ! -f "${clone_dir}/.env" ]; then
+    cp "${clone_dir}/${app_env_template}" "${clone_dir}/.env"
+    boxline "Created ${app_name}/.env from ${app_env_template}"
+  fi
+
+  local install_type
+  if [ "${#app_install_types[@]}" -gt 1 ]; then
+    boxborder "${lyl}Install type for ${app_name}?${dfl}"
+    local type_menu=() t
+    for t in "${app_install_types[@]}"; do
+      type_menu+=("$(boxline "$t")")
+    done
+    install_type="${app_install_types[$(select_opt "${type_menu[@]}")]}"
+  else
+    install_type="${app_install_types[0]}"
+  fi
+
+  case "$install_type" in
+    bare-metal)
+      if declare -F app_setup_bare_metal >/dev/null; then
+        app_setup_bare_metal "$clone_dir"
+      else
+        warn "${app_name}: no bare-metal setup hook defined yet; clone is at ${clone_dir}, follow its README manually"
+      fi
+      ;;
+    docker)
+      if declare -F app_setup_docker >/dev/null; then
+        app_setup_docker "$clone_dir"
+      else
+        warn "${app_name}: no docker setup hook defined yet; clone is at ${clone_dir}, follow its README manually"
+      fi
+      ;;
+    podman)
+      if declare -F app_setup_podman >/dev/null; then
+        app_setup_podman "$clone_dir"
+      else
+        warn "${app_name}: no podman setup hook defined yet; clone is at ${clone_dir}, follow its README manually"
+      fi
+      ;;
+  esac
+}
+
+# Narrow, single-purpose flow for adding a GPU worker node to an existing
+# cf-orch coordinator. circuitforge-orch has no public GitHub mirror (it's
+# CircuitForge's internal coordinator/agent product), so this always clones
+# from Forgejo regardless of provisioning profile.
+#
+# circuitforge-orch's own install.sh has no --topology/--coordinator-url
+# flags - topology and coordinator URL are gathered via its own interactive
+# prompts (read -rp). So this hands off to it interactively rather than
+# trying to script around those prompts.
+#
+# NOTE: circuitforge-orch's installer and README have no model-sync/
+# model-cache-sync mechanism today (checked both, no hits). This wrapper
+# does not invent one - if a node needs that, raise it with circuitforge-orch
+# directly rather than expecting it here.
+provision-orchard-node() {
+  boxborder "${lyl}${unl}Join an existing CircuitForge orchard${dfl}"
+  boxline "This will clone circuitforge-orch and hand off to its own"
+  boxline "installer. When prompted for topology, choose 'agent' and have"
+  boxline "your coordinator's URL ready."
+
+  local apps_base_dir="${cf_apps_dir:?cf_apps_dir must be set before calling provision-orchard-node}"
+  local clone_dir="${apps_base_dir}/circuitforge-orch"
+  local repo_url="https://git.opensourcesolarpunk.com/Circuit-Forge/circuitforge-orch.git"
+
+  if [ -d "$clone_dir" ]; then
+    warn "${clone_dir} already exists, skipping clone (will not overwrite)"
+  else
+    boxline "Cloning circuitforge-orch from Forgejo"
+    run "git clone \"${repo_url}\" \"${clone_dir}\""
+    if [[ $dry_run != true ]]; then
+      mkdir -p "$apps_base_dir"
+      git clone "$repo_url" "$clone_dir"
+    fi
+  fi
+
+  boxline "Handing off to circuitforge-orch's own install.sh..."
+  (cd "$clone_dir" && ./install.sh)
+}

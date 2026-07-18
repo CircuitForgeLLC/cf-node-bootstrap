@@ -1,0 +1,15 @@
+app_name="snipe"
+app_desc="eBay trust-scoring tool (beta)"
+app_repo_url_github="https://github.com/CircuitForgeLLC/snipe.git"
+app_repo_url_forgejo="https://git.opensourcesolarpunk.com/Circuit-Forge/snipe.git"
+app_available_profiles=(oem collaborator)
+app_install_types=(docker)
+app_conda_env=""
+app_env_template=".env.example"
+app_needs_core=true
+
+app_setup_docker() {
+  local dir="$1"
+  boxline "Handing off to ${app_name}'s own install.sh..."
+  (cd "$dir" && ./install.sh)
+}

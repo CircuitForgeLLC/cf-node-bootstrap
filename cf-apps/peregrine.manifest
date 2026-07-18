@@ -1,0 +1,29 @@
+app_name="peregrine"
+app_desc="LLM-powered job discovery and application pipeline (beta)"
+app_repo_url_github="https://github.com/CircuitForgeLLC/peregrine.git"
+app_repo_url_forgejo="https://git.opensourcesolarpunk.com/Circuit-Forge/peregrine.git"
+app_available_profiles=(oem collaborator)
+app_install_types=(bare-metal docker podman)
+app_conda_env="cf"
+app_env_template=".env.example"
+app_needs_core=true
+
+# peregrine ships its own install.sh (installs Docker/Podman + NVIDIA
+# toolkit per-distro) and a Makefile (setup -> preflight -> start, with
+# PROFILE=remote|cpu|single-gpu|dual-gpu). Shell out rather than
+# reimplementing that logic here.
+app_setup_bare_metal() {
+  local dir="$1"
+  boxline "Handing off to ${app_name}'s own install.sh..."
+  (cd "$dir" && ./install.sh)
+}
+
+app_setup_docker() {
+  local dir="$1"
+  boxline "Handing off to ${app_name}'s own install.sh (choose a docker/podman GPU profile when prompted)..."
+  (cd "$dir" && ./install.sh)
+}
+
+app_setup_podman() {
+  app_setup_docker "$1"
+}

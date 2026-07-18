@@ -1,0 +1,32 @@
+app_name="kiwi"
+app_desc="Pantry tracker + leftover recipe suggestions (beta)"
+app_repo_url_github="https://github.com/CircuitForgeLLC/kiwi.git"
+app_repo_url_forgejo="https://git.opensourcesolarpunk.com/Circuit-Forge/kiwi.git"
+app_available_profiles=(oem collaborator)
+app_install_types=(docker bare-metal)
+app_conda_env="kiwi"
+app_env_template=".env.example"
+app_needs_core=true
+
+# kiwi has a single Dockerfile (no compose), listening on 8512. No
+# persistent-storage volume is assumed here since that isn't documented;
+# follow up manually if kiwi needs one for your data to survive a restart.
+app_setup_docker() {
+  local dir="$1"
+  boxline "Building and running ${app_name} (port 8512)..."
+  (cd "$dir" && docker build -t "${app_name}" .)
+  (cd "$dir" && docker run -d --name "${app_name}" --env-file .env -p 8512:8512 "${app_name}")
+}
+
+# kiwi's bare-metal path is documented (docs/getting-started/installation.md,
+# llm-setup.md - BYOK: Ollama/vLLM/OpenAI/Anthropic) but not scripted end to
+# end. This creates the conda env from environment.yml; point the user at
+# the docs for the LLM backend choice rather than guessing one.
+app_setup_bare_metal() {
+  local dir="$1"
+  run "conda env create -f \"${dir}/environment.yml\" -n \"${app_conda_env}\""
+  if [[ $dry_run != true ]]; then
+    conda env create -f "${dir}/environment.yml" -n "${app_conda_env}"
+  fi
+  boxline "${app_name}: conda env '${app_conda_env}' created. See docs/getting-started/installation.md and llm-setup.md for the remaining BYOK LLM backend setup (Ollama/vLLM/OpenAI/Anthropic)."
+}

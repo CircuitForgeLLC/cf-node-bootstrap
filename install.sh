@@ -32,6 +32,11 @@ else
     fi
 fi
 
+# Source CF Apps registry/installer (see cf-apps/README.md)
+if [ -f "${rundir}/lib/cf-apps.functions" ] ; then
+    source "${rundir}/lib/cf-apps.functions"
+fi
+
 rundir_absolute=$(pushd $rundir ; pwd ; popd)
 escape_dir=$(printf %q "${rundir_absolute}")
 logfile="${rundir}/${pretty_date}_${scriptname}.log"
@@ -416,6 +421,11 @@ userinstall(){
     # launch extra installs
     extras-menu
 
+    # Optionally provision this node with CircuitForge apps
+    if declare -F cf-provision-menu >/dev/null; then
+        cf-provision-menu
+    fi
+
     if [[ $dry_run != true ]] ; then
         boxborder "${grn}Please be sure to run ${lyl}sensors-detect --auto${grn} after installation completes${dfl}"
     fi
@@ -484,6 +494,11 @@ globalinstall(){
 
     # Download and install any other extras
     extras-menu
+
+    # Optionally provision this node with CircuitForge apps
+    if declare -F cf-provision-menu >/dev/null; then
+        cf-provision-menu
+    fi
     #clear
 }
 

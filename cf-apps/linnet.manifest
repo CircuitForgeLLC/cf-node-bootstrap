@@ -1,0 +1,17 @@
+app_name="linnet"
+app_desc="Real-time tone annotation product (alpha)"
+app_repo_url_github="https://github.com/CircuitForgeLLC/linnet.git"
+app_repo_url_forgejo="https://git.opensourcesolarpunk.com/Circuit-Forge/linnet.git"
+app_available_profiles=(oem collaborator)
+app_install_types=(docker)
+app_conda_env=""
+app_env_template=".env.example"
+app_needs_core=true
+
+# linnet also has compose.cloud.yml/compose.demo.yml/compose.test.yml;
+# plain compose.yml is the fresh-node default.
+app_setup_docker() {
+  local dir="$1"
+  boxline "Running docker compose up for ${app_name}..."
+  (cd "$dir" && docker compose -f compose.yml up -d)
+}
