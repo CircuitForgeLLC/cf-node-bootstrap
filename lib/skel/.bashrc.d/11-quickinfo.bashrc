@@ -59,6 +59,17 @@ show_disconnected=true
 # separate adapter names with '\|' ex. "lo\|tun0"
 filtered_adapters="lo"
 
+# Interfaces matching these patterns are collapsed into a single summary line
+# (count + up/down) instead of one line each. Keys are extended-regex
+# patterns (matched with =~), values are the label shown in the summary.
+# Docker especially can spawn dozens of br-*/veth* interfaces that would
+# otherwise flood this section.
+declare -A grouped_adapter_patterns=(
+  ["^br-"]="Docker bridges"
+  ["^veth"]="Docker veth pairs"
+  ["^docker[0-9]"]="Docker interfaces"
+)
+
 # Disks
 allowed_disk_prefixes=(
   "sd"
@@ -645,10 +656,16 @@ get_security_info() {
   ssh_sessions=0
   
   # Get failed login attempts
+  # NOTE: filter by _COMM=sshd (the actual binary name) rather than -u sshd/ssh
+  # (the systemd unit name), since that varies by distro (ssh.service on
+  # Debian/Ubuntu, sshd.service on RHEL/Arch) and silently returned zero
+  # matches on the wrong one.
   if command -v journalctl >/dev/null 2>&1; then
-    failed_logins=$(journalctl -u sshd --since yesterday | grep -c "Failed password")
+    failed_logins=$(journalctl _COMM=sshd --since yesterday 2>/dev/null | grep -c "Failed password")
   elif [ -f /var/log/auth.log ]; then
     failed_logins=$(grep -c "Failed password" /var/log/auth.log)
+  elif [ -f /var/log/secure ]; then
+    failed_logins=$(grep -c "Failed password" /var/log/secure)
   fi
   
   # Get last successful login
@@ -754,11 +771,17 @@ get_smart_status() {
 
 get_top_processes() {
   if command -v ps >/dev/null 2>&1; then
+    # 'comm' (bare process name, no path/args) is used instead of 'args' so the
+    # display shows the actual binary name rather than a path truncated before
+    # reaching it. The 'ps' invocation gathering this data is itself excluded
+    # (NR>1 skips the header; $4!="ps" drops the sampling process, which can
+    # otherwise show an inflated %cpu artifact from its own brief runtime).
+
     # Get top 3 CPU processes
-    top_cpu=$(ps -eo pcpu,pid,user,args --sort=-pcpu | head -n 4 | tail -n 3 | awk '{printf "%-5s %-8s %-15.15s\n", $1"%", $3, $4}')
-    
+    top_cpu=$(ps -eo pcpu,pid,user,comm --sort=-pcpu | awk 'NR>1 && $4!="ps"' | head -n 3 | awk '{printf "%-5s %-8s %-15.15s\n", $1"%", $3, $4}')
+
     # Get top 3 memory processes
-    top_mem=$(ps -eo pmem,pid,user,args --sort=-pmem | head -n 4 | tail -n 3 | awk '{printf "%-5s %-8s %-15.15s\n", $1"%", $3, $4}')
+    top_mem=$(ps -eo pmem,pid,user,comm --sort=-pmem | awk 'NR>1 && $4!="ps"' | head -n 3 | awk '{printf "%-5s %-8s %-15.15s\n", $1"%", $3, $4}')
   fi
 }
 
@@ -935,18 +958,37 @@ boxline "	|${unl}Interface       IP Address           MAC Address${dfl}"
 boxline "	|-------------------------------------------------------"
 
 # Echo out network arrays with consistent spacing
+declare -A group_total=()
+declare -A group_up=()
 for ((i=0; i<"${#adapters[@]}"; i++ )); do
   # Skip displaying disconnected interfaces if flag is false
   if [[ $show_disconnected != true ]] && [[ ${ifups[$i]} != "up" ]]; then
     continue
   fi
-  
+
+  # Collapse interfaces matching a grouped pattern into a summary tally
+  # instead of printing them individually (see grouped_adapter_patterns).
+  group_label=""
+  for pattern in "${!grouped_adapter_patterns[@]}"; do
+    if [[ "${adapters[$i]}" =~ $pattern ]]; then
+      group_label="${grouped_adapter_patterns[$pattern]}"
+      break
+    fi
+  done
+  if [[ -n "$group_label" ]]; then
+    group_total[$group_label]=$(( ${group_total[$group_label]:-0} + 1 ))
+    if [[ ${ifups[$i]} == "up" ]]; then
+      group_up[$group_label]=$(( ${group_up[$group_label]:-0} + 1 ))
+    fi
+    continue
+  fi
+
   # Extract plain text without color codes for formatting
   ip_plain=$(echo "${ips[$i]}" | sed 's/\x1b\[[0-9;]*m//g')
-  
+
   # Format columns with fixed widths, adding colors as requested
   interface_col=$(printf "${cyn}%-15s${dfl}" "${adapters[$i]}")
-  
+
   # Handle IP color - yellow for connected, keep existing red for disconnected
   if [[ ${ifups[$i]} == "up" ]]; then
     # For connected IPs, use yellow instead of cyan
@@ -955,13 +997,18 @@ for ((i=0; i<"${#adapters[@]}"; i++ )); do
     # For disconnected IPs, keep the red color but maintain spacing
     ip_col="${ips[$i]}$(printf '%*s' $((19 - ${#ip_plain})) '')"
   fi
-  
+
   # Add light blue for MAC addresses
   mac_col=$(printf "${lbl}%s${dfl}" "${macs[$i]}")
-  
+
   # Combine the formatted columns
   formatted_line="|${interface_col}${ip_col}${mac_col}"
   boxline "	$formatted_line"
+done
+
+# Print one summary line per collapsed group, e.g. "Docker bridges (84): 3 up"
+for group_label in "${!group_total[@]}"; do
+  boxline "	|${cyn}${group_label}${dfl} (${group_total[$group_label]}): ${grn}${group_up[$group_label]:-0} up${dfl}"
 done
 
 # Display WAN IP separately
