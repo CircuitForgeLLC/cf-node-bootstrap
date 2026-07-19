@@ -13,8 +13,11 @@ app_needs_core=false
 
 app_setup_bare_metal() {
   local dir="$1"
-  run "conda run -n ${app_conda_env} pip install -e \"${dir}\""
-  if [[ $dry_run != true ]]; then
+  if [[ $dry_run == true ]]; then
+    boxline "DryRun: conda run -n ${app_conda_env} pip install -e ${dir}"
+  else
+    # run() re-splits its argument as a bare string with no eval, which
+    # mangles the quoted path - execute directly instead.
     conda run -n "${app_conda_env}" pip install -e "${dir}"
   fi
 }

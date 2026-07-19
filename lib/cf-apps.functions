@@ -181,13 +181,15 @@ install-cf-app() {
   local clone_dir="${apps_base_dir}/${app_name}"
   if [ -d "$clone_dir" ]; then
     warn "${clone_dir} already exists, skipping clone (will not overwrite)"
+  elif [[ $dry_run == true ]]; then
+    boxline "DryRun: git clone --recurse-submodules ${repo_url} ${clone_dir}"
   else
+    # run() re-splits its argument as a bare string with no eval, which
+    # mangles anything with embedded quotes (URLs/paths) - execute directly
+    # instead, gated on $dry_run above rather than double-executing via run().
     boxline "Cloning ${app_name} from ${repo_url}"
-    run "git clone --recurse-submodules \"${repo_url}\" \"${clone_dir}\""
-    if [[ $dry_run != true ]]; then
-      mkdir -p "$apps_base_dir"
-      git clone --recurse-submodules "$repo_url" "$clone_dir"
-    fi
+    mkdir -p "$apps_base_dir"
+    git clone --recurse-submodules "$repo_url" "$clone_dir"
   fi
 
   if [ -n "$app_env_template" ] && [ -f "${clone_dir}/${app_env_template}" ] && [ ! -f "${clone_dir}/.env" ]; then
@@ -260,13 +262,13 @@ provision-orchard-node() {
 
   if [ -d "$clone_dir" ]; then
     warn "${clone_dir} already exists, skipping clone (will not overwrite)"
+  elif [[ $dry_run == true ]]; then
+    boxline "DryRun: git clone ${repo_url} ${clone_dir}"
   else
+    # See install-cf-app for why this doesn't route through run().
     boxline "Cloning circuitforge-orch from Forgejo"
-    run "git clone \"${repo_url}\" \"${clone_dir}\""
-    if [[ $dry_run != true ]]; then
-      mkdir -p "$apps_base_dir"
-      git clone "$repo_url" "$clone_dir"
-    fi
+    mkdir -p "$apps_base_dir"
+    git clone "$repo_url" "$clone_dir"
   fi
 
   boxline "Handing off to circuitforge-orch's own install.sh..."

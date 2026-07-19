@@ -24,8 +24,11 @@ app_setup_docker() {
 # the docs for the LLM backend choice rather than guessing one.
 app_setup_bare_metal() {
   local dir="$1"
-  run "conda env create -f \"${dir}/environment.yml\" -n \"${app_conda_env}\""
-  if [[ $dry_run != true ]]; then
+  if [[ $dry_run == true ]]; then
+    boxline "DryRun: conda env create -f ${dir}/environment.yml -n ${app_conda_env}"
+  else
+    # run() re-splits its argument as a bare string with no eval, which
+    # mangles the quoted paths - execute directly instead.
     conda env create -f "${dir}/environment.yml" -n "${app_conda_env}"
   fi
   boxline "${app_name}: conda env '${app_conda_env}' created. See docs/getting-started/installation.md and llm-setup.md for the remaining BYOK LLM backend setup (Ollama/vLLM/OpenAI/Anthropic)."
