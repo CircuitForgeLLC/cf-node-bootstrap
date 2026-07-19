@@ -318,7 +318,13 @@ install-extras(){
     # done
 
     boxborder "Which extras should be installed?"
-    for each in {1..${#_extras[@]}} ; do
+    # NOTE: {1..${#_extras[@]}} does NOT expand as a range - bash performs
+    # brace expansion before parameter expansion, so the range's endpoint
+    # isn't resolved yet when brace expansion runs. This always looped
+    # exactly once (leaving preselect at length 1 regardless of extras
+    # count), invisible only because there was ever just one extra. Use a
+    # C-style loop instead, which resolves ${#_extras[@]} correctly.
+    for ((each=0; each<${#_extras[@]}; each++)); do
         preselect+=("false")
     done
     multiselect result _extras preselect
