@@ -1,0 +1,166 @@
+#!/bin/bash
+# Model/dev-tool cache redirect installer
+#
+# Nodes with a fast secondary local disk mounted at /devl (the convention
+# across CF's rack machines — heimdall, navi, sif) fill up their small root
+# partition fast once pip/torch/vllm/whisper/clip/huggingface caches land in
+# ~/.cache. This redirects those caches to /devl/user-cache and leaves
+# symlinks at the old ~/.cache paths so tools that hardcode ~/.cache (rather
+# than respecting $XDG_CACHE_HOME) still land on the fast disk.
+#
+# Deliberately does NOT touch $HF_HOME — that's the curated model store
+# convention (/Library/Assets/LLM, NFS) and is unrelated to this cache.
+#
+# Only applicable on nodes with a real, separate /devl mount. Skips cleanly
+# (not an error) on nodes without one, since it's an optional extra.
+
+scriptname="${BASH_SOURCE[0]##*/}"
+script_title="${grn}Cache${blu}Redirect${dfl}"
+rundir="${BASH_SOURCE[0]%/*}"
+
+# Source PRbL Functions locally or retrieve from online
+if [ ! -z $prbl_functions ] ; then
+    source $prbl_functions
+else
+    if [ -f ${rundir}/functions ] ; then
+        source ${rundir}/functions
+    else
+        if command -v curl >/dev/null 2>&1; then
+            source <(curl -ks 'https://raw.githubusercontent.com/pyr0ball/PRbL/main/functions')
+        elif command -v wget >/dev/null 2>&1; then
+            source <(wget -qO- 'https://raw.githubusercontent.com/pyr0ball/PRbL/main/functions')
+        elif command -v fetch >/dev/null 2>&1; then
+            source <(fetch -qo- 'https://raw.githubusercontent.com/pyr0ball/PRbL/main/functions')
+        else
+            echo "Error: curl, wget, and fetch commands are not available. Please install one to retrieve PRbL functions."
+            exit 1
+        fi
+    fi
+fi
+
+logfile="${rundir}/${pretty_date}_${scriptname}.log"
+
+cache_root="/devl/user-cache"
+redirected_tools=(pip whisper clip huggingface)
+
+# Real, separate mount at /devl (not just a directory that happens to exist
+# on root) — mirrors how sif/heimdall/navi are actually laid out.
+_devl-is-separate-mount() {
+    [ -d /devl ] && mountpoint -q /devl
+}
+
+check-cache-redirect(){
+    if [[ -n "$XDG_CACHE_HOME" ]] && grep -q "XDG_CACHE_HOME=${cache_root}" "$HOME/.bashrc" 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+install(){
+    if ! _devl-is-separate-mount ; then
+        warn "No separate /devl mount found on this node — skipping cache redirect (nothing to do)"
+        return 0
+    fi
+
+    if check-cache-redirect ; then
+        boxline "Cache redirect already configured (XDG_CACHE_HOME=${cache_root})"
+        return 0
+    fi
+
+    boxborder "${lyl}Redirecting dev-tool caches to ${cache_root}${dfl}"
+
+    # run() executes its argument directly when not in dry-run (and only
+    # boxlines it otherwise) — fine for single literal commands like this.
+    run "mkdir -p ${cache_root}"
+
+    if [[ $dry_run == true ]] ; then
+        boxline "DryRun: append 'export XDG_CACHE_HOME=${cache_root}' to $HOME/.bashrc"
+    else
+        take-backup "$HOME/.bashrc"
+        echo "" >> "$HOME/.bashrc"
+        echo "# Dev-tool caches redirected to fast local disk (see model-cache-redirect extra)" >> "$HOME/.bashrc"
+        echo "export XDG_CACHE_HOME=${cache_root}" >> "$HOME/.bashrc"
+    fi
+
+    # Tools that hardcode ~/.cache/<name> and ignore XDG_CACHE_HOME: move
+    # existing contents onto the fast disk, then symlink the old path back.
+    # This is multi-step (move-if-present, then symlink) so it's driven by
+    # $dry_run directly rather than run() (which only handles single literal
+    # commands).
+    for tool in "${redirected_tools[@]}"; do
+        local old_path="$HOME/.cache/${tool}"
+        local new_path="${cache_root}/${tool}"
+
+        if [ -L "$old_path" ]; then
+            boxline "  ${tool}: already redirected"
+            continue
+        fi
+
+        if [[ $dry_run == true ]] ; then
+            boxline "DryRun: move ${old_path} (if present) to ${new_path}, symlink ${old_path} -> ${new_path}"
+            continue
+        fi
+
+        mkdir -p "$new_path"
+        if [ -d "$old_path" ]; then
+            # Move existing cache contents onto the fast disk rather than
+            # discarding them — avoids a cold-cache redownload.
+            cp -a "$old_path/." "$new_path/" 2>/dev/null
+            rm -rf "$old_path"
+        fi
+        ln -s "$new_path" "$old_path"
+        installed_files+=("$old_path -> $new_path")
+        boxline "  ${tool}: ${gry}~/.cache/${tool} -> ${new_path}${dfl}"
+    done
+
+    boxline ""
+    boxline "${gry}Note: HF_HOME (curated model store) is untouched by design.${dfl}"
+    boxline "${gry}Re-login (or 'source ~/.bashrc') for XDG_CACHE_HOME to take effect.${dfl}"
+}
+
+remove(){
+    warn "Remove is manual for this extra — restoring ~/.cache/<tool> as real dirs"
+    warn "risks re-duplicating data already moved onto ${cache_root}. Not automated."
+}
+
+dry-run-report(){
+    box-rounded
+    boxborder "${grn}Dry-run Report:${dfl}"
+    box-norm
+    boxborder \
+    "installed_files= " \
+    "${installed_files[@]}"
+}
+
+usage(){
+    boxborder \
+    "${script_title} usage:" \
+    "  -i | --install     Redirect dev-tool caches to /devl/user-cache" \
+    "  -D | --dry-run      Show what would change without doing it" \
+    "  -r | --remove       (manual only, see warning)" \
+    "  -h | --help          This menu"
+}
+
+case $1 in
+    -i | --install)
+        install && success " [${script_title} ${lyl}Installed${dfl}]"
+        ;;
+    -r | --remove)
+        remove
+        ;;
+    -D | --dry-run)
+        export dry_run=true
+        install
+        dry-run-report
+        usage
+        unset dry_run
+        success "${script_title} ${lyl}Installer Dry-Run Complete!${dfl}"
+        ;;
+    -h | --help)
+        usage
+        ;;
+    *)
+        warn "Invalid argument $@"
+        usage
+        ;;
+esac
